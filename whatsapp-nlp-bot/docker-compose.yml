@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: whatsapp_nlp_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - whatsapp-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: whatsapp_nlp_backend
+    ports:
+      - "8000:8000"
+    environment:
+      MONGO_URL: mongodb://admin:password@mongodb:27017/whatsapp_nlp_bot?authSource=admin
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
+      DEBUG: "True"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    networks:
+      - whatsapp-network
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: whatsapp_nlp_frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      VITE_API_URL: http://localhost:8000/api
+    volumes:
+      - ./frontend:/app/frontend
+    networks:
+      - whatsapp-network
+    # Start Vite and bind to all interfaces so host can connect
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
+
+volumes:
+  mongo_data:
+
+networks:
+  whatsapp-network:
+    driver: bridge

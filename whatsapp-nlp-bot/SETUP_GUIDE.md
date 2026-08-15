@@ -278,11 +278,6 @@ chmod +x start.sh
 
 ### Example .env
 
-
-```
-
----
-
 ## Troubleshooting
 
 ### Python Issues

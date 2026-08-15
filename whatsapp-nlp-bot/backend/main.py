@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime
 import os
+import json
 from dotenv import load_dotenv
 import logging
 from urllib.parse import parse_qs
@@ -11,7 +12,7 @@ from twilio.rest import Client
 from textblob import TextBlob
 import uvicorn
 import re
-from collections import Counter
+from urllib.request import Request as UrlRequest, urlopen
 
 try:
     from pymongo import MongoClient
@@ -25,6 +26,25 @@ MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "hi")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")
+HF_MODEL = os.getenv("HF_MODEL", "facebook/bart-large-mnli")
+HF_BASE_URL = os.getenv("HF_BASE_URL", "https://api-inference.huggingface.co/models")
+LANGUAGE_OPTIONS = {
+    "1": "en",
+    "2": "hi",
+    "3": "te",
+    "en": "en",
+    "hi": "hi",
+    "te": "te",
+    "english": "en",
+    "hindi": "hi",
+    "hindhi": "hi",
+    "हिंदी": "hi",
+    "हिन्दी": "hi",
+    "telugu": "te",
+    "తెలుగు": "te",
+}
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -310,37 +330,193 @@ def extract_keywords(text: str) -> List[str]:
     return keywords[:5]  # Return top 5 keywords
 
 
-def generate_bot_response(user_message: str, sentiment: str, intent: str) -> str:
-    """Generate bot response based on sentiment, intent and message."""
-    message_lower = user_message.lower()
-    
-    # Intent-based responses
+def call_huggingface_api(text: str) -> Dict:
+    """Call the Hugging Face inference API for scam classification."""
+    if not HF_TOKEN:
+        return {"category": "safe", "confidence": 0.4, "reasons": ["no_model_configured"]}
+
+    payload = {
+        "inputs": text,
+        "parameters": {"candidate_labels": ["safe", "suspicious", "fraud"]},
+    }
+
+    try:
+        request = UrlRequest(
+            f"{HF_BASE_URL}/{HF_MODEL}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        labels = result.get("labels", [])
+        scores = result.get("scores", [])
+        if labels and scores:
+            best_index = max(range(len(scores)), key=lambda i: scores[i])
+            return {
+                "category": labels[best_index],
+                "confidence": round(float(scores[best_index]), 2),
+                "reasons": ["huggingface_classification"],
+            }
+    except Exception as exc:
+        logger.warning(f"Hugging Face API failed: {exc}")
+
+    return {"category": "safe", "confidence": 0.4, "reasons": ["fallback_logic"]}
+
+
+def normalize_phone_number(phone_number: str) -> str:
+    """Normalize phone numbers so the same user always maps to one stored preference."""
+    if not phone_number:
+        return ""
+    value = str(phone_number).strip()
+    value = value.replace("whatsapp:", "").replace(" ", "")
+    if value.startswith("+"):
+        value = value[1:]
+    return value
+
+
+def normalize_language(value: str) -> str:
+    """Normalize language input to en/hi/te."""
+    if not value:
+        return DEFAULT_LOCALE
+    key = str(value).strip().lower()
+    if key in LANGUAGE_OPTIONS:
+        return LANGUAGE_OPTIONS[key]
+    if key in {"telugu", "తెలుగు"}:
+        return "te"
+    if key in {"hindi", "hindhi", "हिंदी", "हिन्दी"}:
+        return "hi"
+    if key in {"english"}:
+        return "en"
+    return DEFAULT_LOCALE
+
+
+def detect_language_selection(text: str) -> Optional[str]:
+    """Detect whether the user explicitly chose a language from the menu."""
+    if not text:
+        return None
+
+    value = str(text).strip().lower().replace(".", "").strip()
+    if value in {"1", "2", "3"}:
+        return LANGUAGE_OPTIONS[value]
+
+    # Only accept explicit language names; ignore greetings or message content.
+    if value in {"english", "hindi", "hindhi", "telugu", "हिंदी", "हिन्दी", "తెలుగు"}:
+        return LANGUAGE_OPTIONS.get(value)
+
+    # Support common writing variations from WhatsApp users.
+    aliases = {
+        "hi": None,
+        "hello": None,
+        "hey": None,
+        "tel": None,
+        "te": None,
+    }
+    if value in aliases:
+        return None
+
+    return None
+
+
+def get_user_language(phone_number: str) -> Optional[str]:
+    """Read the language preference for a user from MongoDB if available."""
+    try:
+        if conversations_collection is None:
+            return None
+        normalized_phone = normalize_phone_number(phone_number)
+        record = conversations_collection.find_one({"phone_number": normalized_phone})
+        if not record:
+            return None
+        return normalize_language(record.get("preferred_language"))
+    except Exception:
+        return None
+
+
+def save_user_language(phone_number: str, language: str):
+    """Persist the selected language for the user."""
+    try:
+        if conversations_collection is None:
+            return
+        normalized_phone = normalize_phone_number(phone_number)
+        conversations_collection.update_one(
+            {"phone_number": normalized_phone},
+            {"$set": {"phone_number": normalized_phone, "preferred_language": normalize_language(language), "updated_at": datetime.now()}},
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not save language: {exc}")
+
+
+def get_language_prompt() -> str:
+    """Return the language menu shown to a first-time user in all three languages."""
+    return (
+        "Please choose your language / अपनी भाषा चुनें / మీ భాషను ఎంచుకోండి\n"
+        "1. English\n"
+        "2. हिन्दी\n"
+        "3. తెలుగు\n\n"
+        "Reply with 1, 2, or 3."
+    )
+
+
+def build_localized_response(category: str, language: str) -> str:
+    """Return a simple user-friendly response in the selected language."""
+    lang = normalize_language(language)
+    category = str(category or "safe").lower()
+    templates = {
+        "en": {
+            "safe": "✅ Your message looks safe. Please still avoid unknown links and never share OTPs or passwords.",
+            "suspicious": "⚠️ This message looks suspicious. Do not click links, do not share OTPs, and verify through official contacts.",
+            "fraud": "🚨 This message appears to be a fraud attempt. Do not share personal details, banking information, or OTPs. Contact the official office directly.",
+        },
+        "hi": {
+            "safe": "✅ आपका संदेश सुरक्षित लग रहा है। फिर भी अज्ञात लिंक पर क्लिक न करें और OTP/पासवर्ड कभी न दें।",
+            "suspicious": "⚠️ यह संदेश संदिग्ध लगता है। लिंक पर क्लिक न करें, OTP न दें, और आधिकारिक संपर्क से पुष्टि करें।",
+            "fraud": "🚨 यह संदेश धोखाधड़ी का प्रयास लग रहा है। अपनी व्यक्तिगत जानकारी, बैंक विवरण या OTP कभी साझा न करें। आधिकारिक कार्यालय से सीधे संपर्क करें।",
+        },
+        "te": {
+            "safe": "✅ మీ సందేశం सुरक्षितంగా కనిపిస్తుంది. అయినా అనుకోని లింక్లపై క్లిక్ చేయకండి మరియు OTP/పాస్వర్డ్ ఇవ్వకండి.",
+            "suspicious": "⚠️ ఈ సందేశం sospectionado గా కనిపిస్తోంది. లింక్‌లను నొక్కవద్దు, OTP ఇవ్వవద్దు, మరియు అధికారిక సంప్రదింపులతో ధృవీకరించండి.",
+            "fraud": "🚨 ఈ సందేశం మోసం ప్రయత్నంగా కనిపిస్తోంది. వ్యక్తిగత సమాచారం, బ్యాంక్ వివరాలు లేదా OTPలను never పంచుకోండి. అధికారిక కార్యాలయాన్ని సంప్రదించండి.",
+        }
+    }
+    text = templates.get(lang, templates["en"]).get(category, templates.get(lang, templates["en"])["safe"])
+    return text
+
+
+def analyze_with_huggingface(text: str) -> Dict:
+    """Classify the message with Hugging Face and fallback to local logic."""
+    hf_result = call_huggingface_api(text)
+    category = str(hf_result.get("category", "safe")).lower()
+    if category not in {"safe", "suspicious", "fraud"}:
+        category = "safe"
+
+    if category == "safe" and detect_scam(text).get("is_scam"):
+        category = "fraud"
+
+    return {
+        "category": category,
+        "confidence": float(hf_result.get("confidence", 0.65) or 0.65),
+        "reasons": hf_result.get("reasons", ["analysis"]),
+        "method": "huggingface",
+    }
+
+
+def generate_bot_response(user_message: str, sentiment: str, intent: str, locale: str = "en", category: str = "safe") -> str:
+    """Minimal response generator for the WhatsApp app."""
+    if category in {"suspicious", "fraud"}:
+        return build_localized_response(category, locale)
+
     if intent == "greeting":
-        return "👋 Hello! How can I help you today?"
-    elif intent == "help":
-        return "🆘 I'm here to help! Can you describe the issue in detail?"
-    elif intent == "gratitude":
-        return "😊 You're welcome! Happy to assist!"
-    elif intent == "farewell":
-        return "👋 Goodbye! Feel free to reach out anytime!"
-    elif intent == "product_inquiry":
-        return "📦 Great question! I'd be happy to tell you more about our products. What would you like to know?"
-    elif intent == "account":
-        return "🔐 For account-related inquiries, please visit our account settings or contact support."
-    elif intent == "billing":
-        return "💳 For billing inquiries, please provide more details so I can assist you better."
-    elif intent == "feedback":
-        return "⭐ Thank you for your feedback! We appreciate your input."
-    elif intent == "scam_report":
-        return "⚠️ It looks like you're reporting a scam. Please share the suspicious message or link so I can analyze it for common scam indicators (shortened links, mismatched domains, urgent requests)."
-    
-    # Sentiment-based responses
+        return "Hello! How can I help?" if locale == "en" else "नमस्कार! मैं आपकी मदद कैसे कर सकता हूँ?" if locale == "hi" else "హలో! నేను ఎలా సహాయం చేయగలను?"
+    if intent == "scam_report":
+        return build_localized_response("fraud", locale)
     if sentiment == "negative":
-        return "😟 I'm sorry to hear that. Let me help you resolve this issue. Can you provide more details?"
-    elif sentiment == "positive":
-        return "😄 Great! I'm glad I could help! Is there anything else I can assist you with?"
-    
-    return "Got it! I'm processing your request. How else can I assist?"
+        return "I am here to help." if locale == "en" else "मैं आपकी मदद के लिए यहाँ हूँ।" if locale == "hi" else "నాకు సహాయం చేయడానికి ఇక్కడ ఉన్నాను."
+    return build_localized_response("safe", locale)
 
 
 # API Endpoints
@@ -418,59 +594,49 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
         if not from_value or not body_value:
             raise HTTPException(status_code=400, detail="Missing From or Body in webhook request")
 
-        phone_number = from_value.replace("whatsapp:", "")
-        user_message = body_value
-        
-        # Enhanced NLP Analysis
+        phone_number = normalize_phone_number(from_value)
+        user_message = body_value.strip()
+
+        selected_language = detect_language_selection(user_message)
+        if selected_language:
+            save_user_language(phone_number, selected_language)
+            locale = selected_language
+            bot_response = "Language saved. Please send your message now."
+            if locale == "hi":
+                bot_response = "भाषा सेव हो गई है। अब अपना संदेश भेजें।"
+            elif locale == "te":
+                bot_response = "భాష సేవ్ అయింది. ఇప్పుడు మీ సందేశాన్ని పంపండి."
+            background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
+            return {"success": True, "message": "Language saved"}
+
+        saved_language = get_user_language(phone_number)
+        if not saved_language:
+            locale = DEFAULT_LOCALE
+            bot_response = get_language_prompt()
+            background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
+            return {"success": True, "message": "Language selection prompt sent"}
+
+        locale = saved_language
         sentiment = analyze_sentiment(user_message)
         intent = detect_intent(user_message)
-        entities = extract_entities(user_message)
-        classification = classify_message(user_message)
-        
-        # Store incoming message with full analysis
+        classification = analyze_with_huggingface(user_message)
+        category = classification.get("category", "safe")
+
         incoming_msg = {
             "phone_number": phone_number,
             "text": user_message,
             "sender": "user",
             "sentiment": sentiment,
             "intent": intent,
-            "entities": entities,
             "classification": classification,
+            "preferred_language": locale,
             "timestamp": datetime.now(),
             "message_sid": message_sid,
-            "status": "processed"
+            "status": "processed",
         }
         incoming_result = messages_collection.insert_one(incoming_msg)
-        logger.info(f"Stored user message: {incoming_result.inserted_id}")
-        
-        # Generate response based on analysis
-        bot_response = generate_bot_response(user_message, sentiment, intent)
 
-        # If scam detected, generate a detailed actionable report for the user
-        try:
-            scam_info = entities.get("scam", {})
-            if scam_info and scam_info.get("is_scam"):
-                reasons = scam_info.get("reasons", [])
-                urls = scam_info.get("urls", [])
-                reasons_readable = ", ".join(reasons) if reasons else "unspecified indicators"
-                urls_readable = "\n".join(urls) if urls else "(no URLs found)"
-                bot_response = (
-                    "⚠️ I detected possible scam indicators in that message.\n\n"
-                    f"Reasons: {reasons_readable}.\n"
-                    f"Suspicious URLs:\n{urls_readable}\n\n"
-                    "Advice: Do NOT click these links. Verify the sender via official channels, avoid sharing personal info, and report the message to your provider."
-                )
-                # Prepend a short classification verdict for clarity in WhatsApp
-                try:
-                    verdict = classification.get("category", "unknown").upper()
-                    confidence = classification.get("confidence", 0)
-                    bot_response = f"[Verdict: {verdict} — {int(confidence*100)}%]\n\n" + bot_response
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"Error building scam response: {e}")
-        
-        # Store bot response
+        bot_response = generate_bot_response(user_message, sentiment, intent, locale=locale, category=category)
         bot_msg = {
             "phone_number": phone_number,
             "text": bot_response,
@@ -478,32 +644,22 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             "sentiment": "neutral",
             "intent": "response",
             "classification": classification,
+            "preferred_language": locale,
             "timestamp": datetime.now(),
             "status": "pending",
-            "linked_to_message": str(incoming_result.inserted_id)
+            "linked_to_message": str(incoming_result.inserted_id),
         }
-        bot_result = messages_collection.insert_one(bot_msg)
-        logger.info(f"Stored bot response: {bot_result.inserted_id}")
-        
-        # Send response via Twilio
-        background_tasks.add_task(
-            send_whatsapp_message,
-            phone_number,
-            bot_response,
-            str(bot_result.inserted_id)
-        )
-        
-        # Update conversation
-        update_conversation(phone_number, sentiment, intent)
-        
+        messages_collection.insert_one(bot_msg)
+        background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
+
         return {
             "success": True,
             "message": "Webhook processed",
             "analysis": {
                 "sentiment": sentiment,
                 "intent": intent,
+                "language": locale,
                 "classification": classification,
-                "entities_found": len(entities.get("keywords", []))
             }
         }
     except Exception as e:
@@ -700,24 +856,21 @@ async def get_conversation_analytics(phone_number: str):
 
 @app.post("/api/messages/analyze")
 async def analyze_message(message: Message):
-    """Analyze a message without storing it"""
+    """Analyze a message without storing it."""
     try:
         sentiment = analyze_sentiment(message.text)
         intent = detect_intent(message.text)
-        entities = extract_entities(message.text)
-        # Include scam analysis and full classification
-        scam_info = detect_scam(message.text)
-        entities["scam"] = scam_info
-        classification = classify_message(message.text)
-        
+        classification = analyze_with_huggingface(message.text)
+        locale = normalize_language(os.getenv("DEFAULT_LOCALE", "hi"))
+
         return {
             "success": True,
             "analysis": {
                 "text": message.text,
                 "sentiment": sentiment,
                 "intent": intent,
-                "entities": entities,
-                "classification": classification
+                "classification": classification,
+                "localized_response": build_localized_response(classification.get("category", "safe"), locale),
             }
         }
     except Exception as e:

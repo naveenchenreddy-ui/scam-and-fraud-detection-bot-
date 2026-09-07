@@ -1,18 +1,18 @@
 # WhatsApp NLP Bot with React Dashboard
 
-A complete end-to-end application for WhatsApp customer support automation using NLP (Natural Language Processing), built with FastAPI, React, MongoDB, and Twilio API integration.
+A complete end-to-end application for WhatsApp customer support automation using NLP (Natural Language Processing), built with FastAPI, React, MySQL, and Twilio API integration.
 
 ## 🎯 Features
 
 - **Real-time Message Processing**: Receive and process WhatsApp messages in real-time
-- **Sentiment Analysis**: Analyze user sentiment using TextBlob NLP
+- **Fraud Detection**: Classify messages with the trained TF-IDF and Logistic Regression model
 - **Auto-Response Generation**: Generate intelligent responses based on message context and sentiment
 - **React Dashboard**: Beautiful, responsive dashboard with Tailwind CSS
 - **Conversation Management**: View and manage all conversations
 - **Message History**: Complete message history with sentiment analysis
 - **Statistics & Analytics**: Real-time dashboard with key metrics
 - **Twilio Integration**: Send/receive WhatsApp messages via Twilio API
-- **MongoDB Database**: Scalable database for storing conversations and messages
+- **MySQL Database**: Relational database for storing conversations and messages
 - **FastAPI Backend**: High-performance Python backend with automatic API documentation
 
 ## 📦 Tech Stack
@@ -20,9 +20,9 @@ A complete end-to-end application for WhatsApp customer support automation using
 ### Backend
 - **FastAPI**: Modern Python web framework
 - **Uvicorn**: ASGI server
-- **MongoDB**: NoSQL database
+- **MySQL**: Relational database
 - **Twilio**: WhatsApp messaging API
-- **TextBlob**: NLP library for sentiment analysis
+- **scikit-learn**: Loads the trained fraud/phishing classifier
 - **Pydantic**: Data validation
 
 ### Frontend
@@ -80,7 +80,7 @@ whatsapp-nlp-bot/
 ### Prerequisites
 - Python 3.11+
 - Node.js 18+
-- MongoDB 7.0+
+- MySQL 8.0+
 - Docker & Docker Compose (optional)
 
 ### Option 1: Local Development Setup
@@ -110,15 +110,11 @@ cp .env.example .env
 nano .env  # or use your editor of choice
 ```
 
-#### 2. Setup MongoDB
+#### 2. Setup MySQL
 
 ```bash
-# Install MongoDB (if not already installed)
-# macOS: brew install mongodb-community
-# Ubuntu: follow MongoDB installation guide
-
-# Start MongoDB
-mongod
+# Create the application database in MySQL
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS whatsapp_nlp_bot;"
 ```
 
 #### 3. Run FastAPI Server
@@ -165,7 +161,7 @@ EOF
 # Build and start all services
 docker-compose up --build
 
-# MongoDB: localhost:27017
+# MySQL: localhost:3306
 # FastAPI: http://localhost:8000
 # React Dashboard: http://localhost:3000
 ```
@@ -175,8 +171,12 @@ docker-compose up --build
 ### Backend (.env)
 
 ```env
-# MongoDB Configuration
-MONGO_URL=mongodb://localhost:27017
+# MySQL Configuration
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your_mysql_password
+MYSQL_DATABASE=whatsapp_nlp_bot
 
 # Twilio Configuration (Get from https://www.twilio.com)
 TWILIO_ACCOUNT_SID=your_account_sid
@@ -317,7 +317,7 @@ curl -X POST http://localhost:8000/api/messages/webhook \
 ## 📈 Performance Optimization
 
 - **Frontend**: Lazy loading with React Router, code splitting with Vite
-- **Backend**: Async/await with FastAPI, connection pooling for MongoDB
+- **Backend**: FastAPI with MySQL connection pooling
 - **Database**: Indexed queries, pagination for large datasets
 - **Caching**: Regular polling instead of WebSockets for demos
 
@@ -328,9 +328,9 @@ curl -X POST http://localhost:8000/api/messages/webhook \
 2. Verify CORS settings in main.py
 3. Check network connectivity
 
-### MongoDB Connection Issues
-1. Ensure MongoDB is running: `mongod`
-2. Check MONGO_URL in .env
+### MySQL Connection Issues
+1. Ensure MySQL is running.
+2. Confirm `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_DATABASE` in `.env`.
 3. Verify credentials if auth enabled
 
 ### Twilio Integration Issues
@@ -376,10 +376,10 @@ For issues and questions:
 ## 🎓 Learning Resources
 
 - **FastAPI Tutorial**: https://fastapi.tiangolo.com
-- **MongoDB Guide**: https://docs.mongodb.com
+- **MySQL Documentation**: https://dev.mysql.com/doc/
 - **React Hooks**: https://react.dev/reference/react
 - **Tailwind Utilities**: https://tailwindcss.com/docs/utility-first
-- **NLP with TextBlob**: https://textblob.readthedocs.io
+- **scikit-learn Documentation**: https://scikit-learn.org/stable/
 
 ## 🚀 Deployment
 
@@ -398,7 +398,7 @@ For issues and questions:
 
 - **Backend**: Heroku, Railway, Render, AWS Lambda
 - **Frontend**: Vercel, Netlify, AWS S3 + CloudFront
-- **Database**: MongoDB Atlas, AWS DocumentDB
+- **Database**: MySQL 8.0+
 
 ## 🎉 Congratulations!
 

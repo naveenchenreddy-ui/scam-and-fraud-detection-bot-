@@ -98,9 +98,6 @@ echo 📚 Documentation:
 echo   • API Swagger: http://localhost:8000/docs
 echo   • API ReDoc: http://localhost:8000/redoc
 echo.
-echo ⚠️  Make sure MongoDB is running separately!
-echo   Command: mongod
-echo.
 echo.
 pause
 

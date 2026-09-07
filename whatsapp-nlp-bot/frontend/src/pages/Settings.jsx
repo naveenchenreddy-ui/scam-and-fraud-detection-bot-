@@ -71,7 +71,9 @@ function Settings() {
       <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
         <h3 className="text-lg font-bold mb-6">Backend Environment Variables</h3>
         <div className="bg-gray-900 rounded-lg p-4 font-mono text-sm text-gray-300 overflow-x-auto space-y-2">
-          <div><span className="text-blue-400">MONGO_URL</span>=mongodb://localhost:27017</div>
+          <div><span className="text-blue-400">MYSQL_HOST</span>=localhost</div>
+          <div><span className="text-blue-400">MYSQL_PORT</span>=3306</div>
+          <div><span className="text-blue-400">MYSQL_DATABASE</span>=whatsapp_nlp_bot</div>
           <div><span className="text-blue-400">TWILIO_ACCOUNT_SID</span>=your_account_sid</div>
           <div><span className="text-blue-400">TWILIO_AUTH_TOKEN</span>=your_auth_token</div>
           <div><span className="text-blue-400">TWILIO_WHATSAPP_NUMBER</span>=+1234567890</div>
@@ -90,9 +92,9 @@ function Settings() {
             </code>
           </div>
           <div>
-            <h4 className="font-semibold text-green-400 mb-2">2. Start MongoDB</h4>
+            <h4 className="font-semibold text-green-400 mb-2">2. Start MySQL</h4>
             <code className="block bg-gray-900 px-4 py-2 rounded text-sm text-gray-300">
-              mongod
+              Start-Service MySQL80
             </code>
           </div>
           <div>

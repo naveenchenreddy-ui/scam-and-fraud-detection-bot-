@@ -38,13 +38,6 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-# Check MongoDB
-if ! command -v mongod &> /dev/null; then
-    echo "⚠️  MongoDB is not installed or not in PATH"
-    echo "   Please ensure MongoDB is running separately"
-    echo "   or install it from https://www.mongodb.com/try/download/community"
-fi
-
 echo ""
 echo "✅ All required tools are installed"
 
@@ -98,14 +91,6 @@ echo ""
 echo "🎯 Starting services..."
 echo "===================="
 
-# Start MongoDB (background)
-if command -v mongod &> /dev/null; then
-    echo "Starting MongoDB..."
-    mongod --quiet &
-    MONGO_PID=$!
-    echo "   ✓ MongoDB started (PID: $MONGO_PID)"
-fi
-
 # Start FastAPI (background)
 echo "Starting FastAPI server..."
 cd backend
@@ -132,7 +117,6 @@ echo ""
 echo "📋 Services:"
 echo "   • FastAPI Backend: http://localhost:8000"
 echo "   • React Dashboard: http://localhost:3000"
-echo "   • MongoDB: localhost:27017"
 echo ""
 echo "📚 Documentation:"
 echo "   • API Swagger: http://localhost:8000/docs"
@@ -144,9 +128,6 @@ echo "   • Frontend: frontend.log"
 echo ""
 echo "❌ To stop all services, run:"
 echo "   kill $BACKEND_PID $FRONTEND_PID"
-if [ ! -z "$MONGO_PID" ]; then
-    echo "   kill $MONGO_PID"
-fi
 echo ""
 echo "Press Ctrl+C to stop"
 echo ""

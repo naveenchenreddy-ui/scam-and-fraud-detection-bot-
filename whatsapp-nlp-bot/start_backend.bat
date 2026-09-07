@@ -13,13 +13,13 @@ set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
 echo [1/4] Checking virtual environment...
-if not exist "venv\" (
+if not exist ".venv\" (
     echo Creating virtual environment...
-    python -m venv venv
+    python -m venv .venv
 )
 
 echo [2/4] Activating virtual environment...
-call venv\Scripts\activate.bat
+call .venv\Scripts\activate.bat
 
 echo [3/4] Installing dependencies...
 pip install -q -r backend\requirements.txt 2>nul
@@ -37,6 +37,6 @@ echo Waiting for server to start...
 echo.
 
 cd backend
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+..\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 pause

@@ -9,27 +9,29 @@ from dotenv import load_dotenv
 import logging
 from urllib.parse import parse_qs
 from twilio.rest import Client
-from textblob import TextBlob
+import joblib
 import uvicorn
-import re
-from urllib.request import Request as UrlRequest, urlopen
-
 try:
-    from pymongo import MongoClient
-except Exception as exc:  # pragma: no cover - import guard for environments without MongoDB driver
-    MongoClient = None
+    from mysql.connector import pooling
+except Exception:  # pragma: no cover - import guard for environments without MySQL driver
+    pooling = None
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Configuration
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "whatsapp_nlp_bot")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "hi")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")
-HF_MODEL = os.getenv("HF_MODEL", "facebook/bart-large-mnli")
-HF_BASE_URL = os.getenv("HF_BASE_URL", "https://api-inference.huggingface.co/models")
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "fraud_phishing_nlp_model.pkl"),
+)
 LANGUAGE_OPTIONS = {
     "1": "en",
     "2": "hi",
@@ -62,24 +64,228 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MongoDB connection
-mongo_client = None
-db = None
-conversations_collection = None
-messages_collection = None
+class MySQLDatabase:
+    """Small repository for the conversation and message tables."""
 
-try:
-    if MongoClient is not None:
-        mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
-        mongo_client.admin.command("ping")
-        db = mongo_client["whatsapp_nlp_bot"]
-        conversations_collection = db["conversations"]
-        messages_collection = db["messages"]
-        logger.info("Connected to MongoDB")
-    else:
-        raise RuntimeError("pymongo is not available")
-except Exception as e:
-    logger.warning(f"MongoDB connection error: {e}")
+    def __init__(self):
+        self.pool = None
+        if pooling is None:
+            logger.warning("mysql-connector-python is not available")
+            return
+        try:
+            self.pool = pooling.MySQLConnectionPool(
+                pool_name="whatsapp_nlp_pool", pool_size=5,
+                host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
+                password=MYSQL_PASSWORD, database=MYSQL_DATABASE,
+            )
+            self._create_tables()
+            logger.info("Connected to MySQL")
+        except Exception as exc:
+            logger.warning(f"MySQL connection error: {exc}")
+            self.pool = None
+
+    def _connection(self):
+        if self.pool is None:
+            raise RuntimeError("MySQL is not connected")
+        return self.pool.get_connection()
+
+    def _create_tables(self):
+        connection = self._connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    phone_number VARCHAR(64) NOT NULL UNIQUE,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    message_count INT NOT NULL DEFAULT 0,
+                    preferred_language VARCHAR(8) NULL,
+                    sentiment_count JSON NULL,
+                    intent_count JSON NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    phone_number VARCHAR(64) NOT NULL,
+                    text TEXT NOT NULL,
+                    sender VARCHAR(16) NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    sentiment VARCHAR(32) NULL,
+                    intent VARCHAR(64) NULL,
+                    classification JSON NULL,
+                    preferred_language VARCHAR(8) NULL,
+                    message_sid VARCHAR(128) NULL,
+                    status VARCHAR(32) NULL,
+                    linked_to_message VARCHAR(64) NULL,
+                    entities JSON NULL,
+                    sent_at DATETIME NULL,
+                    INDEX idx_messages_phone_time (phone_number, timestamp)
+                )
+            """)
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+
+    @staticmethod
+    def _json(value):
+        return json.dumps(value) if value is not None else None
+
+    @staticmethod
+    def _message_row(row):
+        if row is None:
+            return None
+        row["_id"] = str(row.pop("id"))
+        for key in ("classification", "entities"):
+            if isinstance(row.get(key), str):
+                row[key] = json.loads(row[key])
+        return row
+
+    @staticmethod
+    def _conversation_row(row):
+        if row is None:
+            return None
+        row["_id"] = str(row.pop("id"))
+        for key in ("sentiment_count", "intent_count"):
+            if isinstance(row.get(key), str):
+                row[key] = json.loads(row[key])
+        return row
+
+    def insert_message(self, message):
+        values = (
+            message.get("phone_number"), message.get("text", ""), message.get("sender"),
+            message.get("timestamp") or datetime.now(), message.get("sentiment"),
+            message.get("intent"), self._json(message.get("classification")),
+            message.get("preferred_language"), message.get("message_sid"),
+            message.get("status"), message.get("linked_to_message"), self._json(message.get("entities")),
+        )
+        connection = self._connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO messages
+                (phone_number, text, sender, timestamp, sentiment, intent, classification,
+                 preferred_language, message_sid, status, linked_to_message, entities)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, values)
+            connection.commit()
+            return cursor.lastrowid
+        finally:
+            cursor.close()
+            connection.close()
+
+    def update_message_status(self, message_id, status, sent_at):
+        connection = self._connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("UPDATE messages SET status = %s, sent_at = %s WHERE id = %s", (status, sent_at, message_id))
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+
+    def get_language(self, phone_number):
+        connection = self._connection()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT preferred_language FROM conversations WHERE phone_number = %s", (phone_number,))
+            row = cursor.fetchone()
+            return row["preferred_language"] if row else None
+        finally:
+            cursor.close()
+            connection.close()
+
+    def save_language(self, phone_number, language):
+        now = datetime.now()
+        connection = self._connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO conversations (phone_number, created_at, updated_at, status, preferred_language)
+                VALUES (%s, %s, %s, 'active', %s)
+                ON DUPLICATE KEY UPDATE preferred_language = VALUES(preferred_language), updated_at = VALUES(updated_at)
+            """, (phone_number, now, now, language))
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+
+    def list_conversations(self, skip, limit):
+        connection = self._connection()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT %s OFFSET %s", (limit, skip))
+            rows = [self._conversation_row(row) for row in cursor.fetchall()]
+            cursor.execute("SELECT COUNT(*) AS total FROM conversations")
+            return rows, cursor.fetchone()["total"]
+        finally:
+            cursor.close()
+            connection.close()
+
+    def get_conversation(self, phone_number):
+        connection = self._connection()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM conversations WHERE phone_number = %s", (phone_number,))
+            conversation = self._conversation_row(cursor.fetchone())
+            cursor.execute("SELECT * FROM messages WHERE phone_number = %s ORDER BY timestamp ASC, id ASC", (phone_number,))
+            messages = [self._message_row(row) for row in cursor.fetchall()]
+            return conversation, messages
+        finally:
+            cursor.close()
+            connection.close()
+
+    def get_messages(self, phone_number, skip, limit):
+        connection = self._connection()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM messages WHERE phone_number = %s ORDER BY timestamp DESC, id DESC LIMIT %s OFFSET %s", (phone_number, limit, skip))
+            messages = [self._message_row(row) for row in cursor.fetchall()]
+            cursor.execute("SELECT COUNT(*) AS total FROM messages WHERE phone_number = %s", (phone_number,))
+            return messages, cursor.fetchone()["total"]
+        finally:
+            cursor.close()
+            connection.close()
+
+    def stats(self):
+        connection = self._connection()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT COUNT(*) AS total FROM conversations")
+            total_conversations = cursor.fetchone()["total"]
+            cursor.execute("SELECT COUNT(*) AS total FROM messages")
+            total_messages = cursor.fetchone()["total"]
+            cursor.execute("SELECT COUNT(*) AS total FROM conversations WHERE status = 'active'")
+            active_conversations = cursor.fetchone()["total"]
+            cursor.execute("SELECT sentiment, COUNT(*) AS count FROM messages WHERE sender = 'user' AND sentiment IS NOT NULL GROUP BY sentiment")
+            sentiment_distribution = {row["sentiment"]: row["count"] for row in cursor.fetchall()}
+            cursor.execute("SELECT intent, COUNT(*) AS count FROM messages WHERE sender = 'user' AND intent IS NOT NULL GROUP BY intent")
+            intent_distribution = {row["intent"]: row["count"] for row in cursor.fetchall()}
+            return total_conversations, total_messages, active_conversations, sentiment_distribution, intent_distribution
+        finally:
+            cursor.close()
+            connection.close()
+
+    def update_conversation(self, phone_number, sentiment=None, intent=None):
+        now = datetime.now()
+        connection = self._connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO conversations (phone_number, created_at, updated_at, status, message_count)
+                VALUES (%s, %s, %s, 'active', 1)
+                ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at), message_count = message_count + 1
+            """, (phone_number, now, now))
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+
+
+database = MySQLDatabase()
 
 # Twilio client
 twilio_client = None
@@ -92,6 +298,13 @@ try:
         logger.warning("Twilio credentials are missing in environment")
 except Exception as e:
     logger.warning(f"Twilio initialization error: {e}")
+
+trained_model = None
+try:
+    trained_model = joblib.load(MODEL_PATH)
+    logger.info(f"Loaded fraud detection model from {MODEL_PATH}")
+except Exception as exc:
+    logger.warning(f"Fraud detection model is unavailable: {exc}")
 
 
 # Pydantic models
@@ -124,248 +337,48 @@ class DashboardStats(BaseModel):
     sentiment_distribution: dict
 
 
-# NLP Functions
-def analyze_sentiment(text: str) -> str:
-    """Analyze sentiment using TextBlob with a lightweight fallback."""
-    if not text:
-        return "neutral"
+# ------------------------------------------------------------------
+# NLP / message analysis
+#
+# All message classification now goes through the trained TF-IDF +
+# Logistic Regression model (see fraud_phishing_nlp_model.pkl, trained
+# in the companion notebook). The previous keyword/regex heuristics
+# have been removed in favor of this single model-based analysis path.
+# ------------------------------------------------------------------
 
-    try:
-        analysis = TextBlob(text)
-        polarity = analysis.sentiment.polarity
-    except Exception:
-        text_lower = text.lower()
-        positive_words = ["love", "great", "good", "happy", "thanks", "thank", "excellent", "awesome"]
-        negative_words = ["bad", "terrible", "hate", "angry", "sad", "issue", "problem"]
-        positive_hits = sum(1 for word in positive_words if word in text_lower)
-        negative_hits = sum(1 for word in negative_words if word in text_lower)
-        if positive_hits > negative_hits:
-            return "positive"
-        if negative_hits > positive_hits:
-            return "negative"
-        return "neutral"
+def analyze_with_trained_model(text: str) -> Dict:
+    """Classify text with the TF-IDF and Logistic Regression model.
 
-    if polarity > 0.1:
-        return "positive"
-    elif polarity < -0.1:
-        return "negative"
-    else:
-        return "neutral"
-
-
-def detect_scam(text: str) -> Dict:
-    """Detect possible scam indicators in a text.
-
-    Returns a dict: {"is_scam": bool, "reasons": List[str], "urls": List[str]}
+    Returns: {
+        "category": "fraud" | "legitimate",
+        "confidence": float,
+        "class_probabilities": {label: probability, ...},
+        "method": "tfidf_logistic_regression",
+    }
     """
-    if not text:
-        return {"is_scam": False, "reasons": [], "urls": []}
-
-    reasons = []
-    urls = re.findall(r'http[s]?://\S+', text)
-
-    # Common URL shorteners or suspicious domains
-    shorteners = ["bit.ly", "t.co", "tinyurl", "goo.gl", "onelink.me", "ow.ly"]
-    for u in urls:
-        hostname = re.sub(r'https?://', '', u).split('/')[0].lower()
-        if any(s in hostname for s in shorteners):
-            reasons.append("shortened_link")
-        if re.search(r'onelink|short|click|verify|login', u.lower()):
-            reasons.append("suspicious_link")
-
-    # Suspicious language often used in scams
-    suspicious_words = [
-        "urgent", "immediately", "verify", "click", "login", "account",
-        "suspend", "password", "prize", "congratulations", "winner", "claim"
-    ]
-    if any(w in text.lower() for w in suspicious_words):
-        reasons.append("suspicious_language")
-
-    # Presence of extremely short or encoded tokens (e.g., many punctuation characters)
-    if re.search(r'\b\w{1,2}:[0-9a-f]{6,}\b', text.lower()):
-        reasons.append("encoded_token")
-
-    is_scam = len(reasons) > 0
-    return {"is_scam": is_scam, "reasons": list(dict.fromkeys(reasons)), "urls": urls}
-
-
-def classify_message(text: str) -> Dict:
-    """Classify message into categories: scam, phishing, fake_news, safe.
-
-    Returns: {"category": str, "confidence": float, "reasons": List[str]}
-    """
-    reasons = []
-    text_lower = (text or "").lower()
-
-    # Run scam detector
-    scam_info = detect_scam(text)
-    if scam_info.get("is_scam"):
-        reasons.extend(scam_info.get("reasons", []))
-
-    # Phishing heuristics: requests for credentials, password reset prompts, login links
-    phishing_indicators = ["verify your account", "login", "password", "reset your password", "enter your", "one-time passcode", "otp", "ssn", "account suspended"]
-    if any(p in text_lower for p in phishing_indicators):
-        reasons.append("phishing_language")
-
-    # Fake news heuristics: sensational phrases, all caps, 'breaking', 'unbelievable', 'viral'
-    fake_news_indicators = ["breaking", "unbelievable", "shocking", "viral", "confirmed", "sources say", "exclusive"]
-    if any(f in text_lower for f in fake_news_indicators) or (sum(1 for c in text if c.isupper()) > max(10, len(text) * 0.2)):
-        reasons.append("fake_news_language")
-
-    # Decide category
-    category = "safe"
-    confidence = 0.0
-
-    if "phishing_language" in reasons:
-        category = "phishing"
-        confidence = 0.85
-    elif scam_info.get("is_scam"):
-        category = "scam"
-        confidence = 0.8
-    elif "fake_news_language" in reasons:
-        category = "fake_news"
-        confidence = 0.7
-    else:
-        category = "safe"
-        confidence = 0.5
-
-    # refine confidence based on number of reasons
-    confidence = min(0.99, confidence + 0.05 * max(0, len(reasons) - 1))
-
-    return {"category": category, "confidence": round(confidence, 2), "reasons": list(dict.fromkeys(reasons))}
-
-
-def detect_threat_type(text: str) -> str:
-    """Classify the message into one of: scam, phishing, fake_news, safe.
-
-    Uses simple heuristics: relies on `detect_scam` and keyword patterns.
-    """
-    text_lower = text.lower() if text else ""
-
-    # Check for phishing: credential requests + link or urgent action
-    phishing_keywords = ["password", "login", "verify", "credentials", "ssn", "bank", "account", "card"]
-    has_phishing_kw = any(k in text_lower for k in phishing_keywords)
-    has_link = bool(re.search(r'http[s]?://', text_lower))
-    if has_phishing_kw and has_link:
-        return "phishing"
-
-    # Check scam using existing detector
-    try:
-        scam_info = detect_scam(text)
-        if scam_info.get("is_scam"):
-            return "scam"
-    except Exception:
-        pass
-
-    # Fake news heuristic: sensational phrases, many exclamation marks, ALL CAPS claims
-    fake_keywords = ["breaking", "exclusive", "shocking", "rumor", "viral", "unbelievable"]
-    if any(k in text_lower for k in fake_keywords) or text.count("!") >= 3 or re.search(r'\b[A-Z]{6,}\b', text):
-        return "fake_news"
-
-    return "safe"
-
-
-def detect_intent(text: str) -> str:
-    """Detect user intent from message."""
-    text_lower = text.lower()
-
-    # If scam indicators are present, prefer scam_report intent
-    try:
-        scam_info = detect_scam(text)
-        if scam_info.get("is_scam"):
-            return "scam_report"
-    except Exception:
-        pass
-
-    intent_patterns = {
-        "greeting": ["hello", "hi", "hey", "greetings", "hiya", "sup"],
-        "help": ["help", "support", "assist", "issue", "problem", "error", "bug"],
-        "scam_report": ["scam", "phish", "phishing", "fraud", "suspicious", "scammer", "suspicious link", "report scam", "detect scam"],
-        "gratitude": ["thank", "thanks", "appreciate", "appreciate", "grateful"],
-        "farewell": ["bye", "goodbye", "see you", "later", "exit"],
-        "product_inquiry": ["product", "price", "cost", "feature", "how much", "what's the price"],
-        "account": ["account", "login", "password", "reset", "profile"],
-        "billing": ["bill", "invoice", "payment", "charge", "refund", "cancel"],
-        "feedback": ["feedback", "review", "rating", "suggestion", "complaint"]
-    }
-    
-    for intent, keywords in intent_patterns.items():
-        if any(keyword in text_lower for keyword in keywords):
-            return intent
-    
-    return "general_inquiry"
-
-
-def extract_entities(text: str) -> Dict[str, List[str]]:
-    """Extract named entities and important terms from text."""
-    entities = {
-        "numbers": re.findall(r'\d+', text),
-        "emails": re.findall(r'[\w\.-]+@[\w\.-]+', text),
-        "urls": re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text),
-        "keywords": extract_keywords(text)
-    }
-    try:
-        entities["scam"] = detect_scam(text)
-    except Exception:
-        entities["scam"] = {"is_scam": False, "reasons": [], "urls": []}
-    return entities
-
-
-def extract_keywords(text: str) -> List[str]:
-    """Extract important keywords from text."""
-    # Remove common stop words
-    stop_words = {
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", 
-        "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-        "do", "does", "did", "will", "would", "could", "should", "may", "might",
-        "can", "i", "you", "he", "she", "it", "we", "they", "what", "which",
-        "who", "when", "where", "why", "how", "this", "that", "these", "those"
-    }
-    
-    words = text.lower().split()
-    keywords = [word.strip('.,!?;:') for word in words 
-                if word.lower().strip('.,!?;:') not in stop_words 
-                and len(word.strip('.,!?;:')) > 3]
-    
-    return keywords[:5]  # Return top 5 keywords
-
-
-def call_huggingface_api(text: str) -> Dict:
-    """Call the Hugging Face inference API for scam classification."""
-    if not HF_TOKEN:
-        return {"category": "safe", "confidence": 0.4, "reasons": ["no_model_configured"]}
-
-    payload = {
-        "inputs": text,
-        "parameters": {"candidate_labels": ["safe", "suspicious", "fraud"]},
-    }
-
-    try:
-        request = UrlRequest(
-            f"{HF_BASE_URL}/{HF_MODEL}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {HF_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
+    if trained_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Trained fraud model not found at {MODEL_PATH}. "
+                "Copy fraud_phishing_nlp_model.pkl into backend/ first."
+            ),
         )
-        with urlopen(request, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
 
-        labels = result.get("labels", [])
-        scores = result.get("scores", [])
-        if labels and scores:
-            best_index = max(range(len(scores)), key=lambda i: scores[i])
-            return {
-                "category": labels[best_index],
-                "confidence": round(float(scores[best_index]), 2),
-                "reasons": ["huggingface_classification"],
-            }
-    except Exception as exc:
-        logger.warning(f"Hugging Face API failed: {exc}")
+    prediction = str(trained_model.predict([text])[0]).lower()
+    probabilities = trained_model.predict_proba([text])[0]
+    class_probabilities = {
+        str(label): round(float(probability), 4)
+        for label, probability in zip(trained_model.classes_, probabilities)
+    }
+    confidence = max(class_probabilities.values())
 
-    return {"category": "safe", "confidence": 0.4, "reasons": ["fallback_logic"]}
+    return {
+        "category": prediction,
+        "confidence": confidence,
+        "class_probabilities": class_probabilities,
+        "method": "tfidf_logistic_regression",
+    }
 
 
 def normalize_phone_number(phone_number: str) -> str:
@@ -423,15 +436,15 @@ def detect_language_selection(text: str) -> Optional[str]:
 
 
 def get_user_language(phone_number: str) -> Optional[str]:
-    """Read the language preference for a user from MongoDB if available."""
+    """Read the language preference for a user from MySQL if available."""
     try:
-        if conversations_collection is None:
+        if database.pool is None:
             return None
         normalized_phone = normalize_phone_number(phone_number)
-        record = conversations_collection.find_one({"phone_number": normalized_phone})
-        if not record:
+        language = database.get_language(normalized_phone)
+        if not language:
             return None
-        return normalize_language(record.get("preferred_language"))
+        return normalize_language(language)
     except Exception:
         return None
 
@@ -439,14 +452,10 @@ def get_user_language(phone_number: str) -> Optional[str]:
 def save_user_language(phone_number: str, language: str):
     """Persist the selected language for the user."""
     try:
-        if conversations_collection is None:
+        if database.pool is None:
             return
         normalized_phone = normalize_phone_number(phone_number)
-        conversations_collection.update_one(
-            {"phone_number": normalized_phone},
-            {"$set": {"phone_number": normalized_phone, "preferred_language": normalize_language(language), "updated_at": datetime.now()}},
-            upsert=True,
-        )
+        database.save_language(normalized_phone, normalize_language(language))
     except Exception as exc:
         logger.warning(f"Could not save language: {exc}")
 
@@ -463,9 +472,16 @@ def get_language_prompt() -> str:
 
 
 def build_localized_response(category: str, language: str) -> str:
-    """Return a simple user-friendly response in the selected language."""
+    """Return a simple user-friendly response in the selected language.
+
+    `category` is the label returned by the trained model ("fraud" or
+    "legitimate"); it is mapped onto the "safe" / "fraud" response
+    templates below.
+    """
     lang = normalize_language(language)
-    category = str(category or "safe").lower()
+    category = str(category or "legitimate").lower()
+    if category == "legitimate":
+        category = "safe"
     templates = {
         "en": {
             "safe": "✅ Your message looks safe. Please still avoid unknown links and never share OTPs or passwords.",
@@ -487,33 +503,17 @@ def build_localized_response(category: str, language: str) -> str:
     return text
 
 
-def analyze_with_huggingface(text: str) -> Dict:
-    """Classify the message with Hugging Face and fallback to local logic."""
-    hf_result = call_huggingface_api(text)
-    category = str(hf_result.get("category", "safe")).lower()
-    if category not in {"safe", "suspicious", "fraud"}:
-        category = "safe"
+def generate_bot_response(user_message: str, sentiment: str, intent: str, locale: str = "en", category: str = "legitimate") -> str:
+    """Minimal response generator for the WhatsApp app.
 
-    if category == "safe" and detect_scam(text).get("is_scam"):
-        category = "fraud"
-
-    return {
-        "category": category,
-        "confidence": float(hf_result.get("confidence", 0.65) or 0.65),
-        "reasons": hf_result.get("reasons", ["analysis"]),
-        "method": "huggingface",
-    }
-
-
-def generate_bot_response(user_message: str, sentiment: str, intent: str, locale: str = "en", category: str = "safe") -> str:
-    """Minimal response generator for the WhatsApp app."""
-    if category in {"suspicious", "fraud"}:
-        return build_localized_response(category, locale)
+    `category` comes straight from analyze_with_trained_model() ("fraud"
+    or "legitimate").
+    """
+    if category == "fraud":
+        return build_localized_response("fraud", locale)
 
     if intent == "greeting":
         return "Hello! How can I help?" if locale == "en" else "नमस्कार! मैं आपकी मदद कैसे कर सकता हूँ?" if locale == "hi" else "హలో! నేను ఎలా సహాయం చేయగలను?"
-    if intent == "scam_report":
-        return build_localized_response("fraud", locale)
     if sentiment == "negative":
         return "I am here to help." if locale == "en" else "मैं आपकी मदद के लिए यहाँ हूँ।" if locale == "hi" else "నాకు సహాయం చేయడానికి ఇక్కడ ఉన్నాను."
     return build_localized_response("safe", locale)
@@ -543,7 +543,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "mongodb": "connected" if mongo_client else "disconnected",
+        "mysql": "connected" if database.pool else "disconnected",
         "twilio": "configured" if twilio_client else "not configured"
     }
 
@@ -552,10 +552,9 @@ async def health_check():
 async def send_message(message: Message, background_tasks: BackgroundTasks):
     """Send a message via WhatsApp"""
     try:
-        # Store message in MongoDB
         message.timestamp = datetime.now()
         message_dict = message.dict()
-        result = messages_collection.insert_one(message_dict)
+        message_id = database.insert_message(message_dict)
         
         # Send via Twilio (non-blocking)
         background_tasks.add_task(
@@ -566,7 +565,7 @@ async def send_message(message: Message, background_tasks: BackgroundTasks):
         
         return {
             "success": True,
-            "message_id": str(result.inserted_id),
+            "message_id": str(message_id),
             "timestamp": message.timestamp
         }
     except Exception as e:
@@ -611,16 +610,19 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
 
         saved_language = get_user_language(phone_number)
         if not saved_language:
-            locale = DEFAULT_LOCALE
-            bot_response = get_language_prompt()
-            background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
-            return {"success": True, "message": "Language selection prompt sent"}
+            language_prompt = get_language_prompt()
+            background_tasks.add_task(send_whatsapp_message, phone_number, language_prompt)
+            return {
+                "success": True,
+                "message": "Language selection required",
+                "language_prompt": language_prompt,
+            }
 
         locale = saved_language
-        sentiment = analyze_sentiment(user_message)
-        intent = detect_intent(user_message)
-        classification = analyze_with_huggingface(user_message)
-        category = classification.get("category", "safe")
+        sentiment = None
+        intent = "fraud_detection"
+        classification = analyze_with_trained_model(user_message)
+        category = classification.get("category", "legitimate")
 
         incoming_msg = {
             "phone_number": phone_number,
@@ -634,7 +636,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             "message_sid": message_sid,
             "status": "processed",
         }
-        incoming_result = messages_collection.insert_one(incoming_msg)
+        incoming_message_id = database.insert_message(incoming_msg)
 
         bot_response = generate_bot_response(user_message, sentiment, intent, locale=locale, category=category)
         bot_msg = {
@@ -647,9 +649,9 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             "preferred_language": locale,
             "timestamp": datetime.now(),
             "status": "pending",
-            "linked_to_message": str(incoming_result.inserted_id),
+            "linked_to_message": str(incoming_message_id),
         }
-        messages_collection.insert_one(bot_msg)
+        database.insert_message(bot_msg)
         background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
 
         return {
@@ -662,6 +664,8 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
                 "classification": classification,
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -672,17 +676,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
 async def get_conversations(skip: int = 0, limit: int = 10):
     """Get all conversations"""
     try:
-        conversations = list(
-            conversations_collection.find()
-            .skip(skip)
-            .limit(limit)
-            .sort("updated_at", -1)
-        )
-        
-        for conv in conversations:
-            conv["_id"] = str(conv["_id"])
-        
-        total = conversations_collection.count_documents({})
+        conversations, total = database.list_conversations(skip, limit)
         
         return {
             "success": True,
@@ -699,23 +693,7 @@ async def get_conversation(phone_number: str):
     """Get specific conversation"""
     try:
         # Get conversation
-        conversation = conversations_collection.find_one(
-            {"phone_number": phone_number}
-        )
-        
-        # Get messages
-        messages = list(
-            messages_collection.find(
-                {"phone_number": phone_number}
-            ).sort("timestamp", 1)
-        )
-        
-        if conversation:
-            conversation["_id"] = str(conversation["_id"])
-        
-        for msg in messages:
-            msg["_id"] = str(msg["_id"])
-            msg["timestamp"] = msg["timestamp"].isoformat()
+        conversation, messages = database.get_conversation(phone_number)
         
         return {
             "success": True,
@@ -731,21 +709,7 @@ async def get_conversation(phone_number: str):
 async def get_messages(phone_number: str, skip: int = 0, limit: int = 50):
     """Get messages for a conversation"""
     try:
-        messages = list(
-            messages_collection.find(
-                {"phone_number": phone_number}
-            )
-            .skip(skip)
-            .limit(limit)
-            .sort("timestamp", -1)
-        )
-        
-        for msg in messages:
-            msg["_id"] = str(msg["_id"])
-            if isinstance(msg.get("timestamp"), datetime):
-                msg["timestamp"] = msg["timestamp"].isoformat()
-        
-        total = messages_collection.count_documents({"phone_number": phone_number})
+        messages, total = database.get_messages(phone_number, skip, limit)
         
         return {
             "success": True,
@@ -761,33 +725,7 @@ async def get_messages(phone_number: str, skip: int = 0, limit: int = 50):
 async def get_dashboard_stats():
     """Get dashboard statistics"""
     try:
-        total_conversations = conversations_collection.count_documents({})
-        total_messages = messages_collection.count_documents({})
-        active_conversations = conversations_collection.count_documents(
-            {"status": "active"}
-        )
-        
-        # Sentiment distribution
-        sentiment_pipeline = [
-            {"$match": {"sender": "user"}},
-            {"$group": {"_id": "$sentiment", "count": {"$sum": 1}}},
-            {"$match": {"_id": {"$ne": None}}}
-        ]
-        sentiment_data = list(messages_collection.aggregate(sentiment_pipeline))
-        sentiment_distribution = {
-            item["_id"]: item["count"] for item in sentiment_data
-        }
-        
-        # Intent distribution
-        intent_pipeline = [
-            {"$match": {"sender": "user"}},
-            {"$group": {"_id": "$intent", "count": {"$sum": 1}}},
-            {"$match": {"_id": {"$ne": None}}}
-        ]
-        intent_data = list(messages_collection.aggregate(intent_pipeline))
-        intent_distribution = {
-            item["_id"]: item["count"] for item in intent_data
-        }
+        total_conversations, total_messages, active_conversations, sentiment_distribution, intent_distribution = database.stats()
         
         return {
             "success": True,
@@ -807,11 +745,7 @@ async def get_conversation_analytics(phone_number: str):
     """Get detailed analytics for a conversation"""
     try:
         # Get all messages
-        messages = list(
-            messages_collection.find(
-                {"phone_number": phone_number}
-            ).sort("timestamp", 1)
-        )
+        _, messages = database.get_conversation(phone_number)
         
         # Calculate statistics
         user_messages = [m for m in messages if m.get("sender") == "user"]
@@ -858,21 +792,20 @@ async def get_conversation_analytics(phone_number: str):
 async def analyze_message(message: Message):
     """Analyze a message without storing it."""
     try:
-        sentiment = analyze_sentiment(message.text)
-        intent = detect_intent(message.text)
-        classification = analyze_with_huggingface(message.text)
+        classification = analyze_with_trained_model(message.text)
         locale = normalize_language(os.getenv("DEFAULT_LOCALE", "hi"))
 
         return {
             "success": True,
             "analysis": {
                 "text": message.text,
-                "sentiment": sentiment,
-                "intent": intent,
+                "intent": "fraud_detection",
                 "classification": classification,
-                "localized_response": build_localized_response(classification.get("category", "safe"), locale),
+                "localized_response": build_localized_response(classification.get("category", "legitimate"), locale),
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error analyzing message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -906,16 +839,7 @@ def send_whatsapp_message(phone_number: str, message: str, message_id: str = Non
             return
 
         if message_id:
-            try:
-                from bson import ObjectId
-                query_id = ObjectId(message_id)
-            except Exception:
-                query_id = message_id
-
-            messages_collection.update_one(
-                {"_id": query_id},
-                {"$set": {"status": "sent", "sent_at": datetime.now()}}
-            )
+            database.update_message_status(message_id, "sent", datetime.now())
 
         logger.info(f"WhatsApp message sent to {phone_number}")
     except Exception as e:
@@ -925,41 +849,9 @@ def send_whatsapp_message(phone_number: str, message: str, message_id: str = Non
 def update_conversation(phone_number: str, sentiment: str = None, intent: str = None):
     """Update conversation timestamp and statistics"""
     try:
-        update_data = {
-            "updated_at": datetime.now(),
-        }
-        
-        if sentiment:
-            update_data[f"sentiment_count.{sentiment}"] = 1
-        
-        if intent:
-            update_data[f"intent_count.{intent}"] = 1
-        
-        update_command = {
-            "$set": update_data,
-            "$inc": {"message_count": 1}
-        }
-
-        insert_data = {
-            "phone_number": phone_number,
-            "created_at": datetime.now(),
-            "status": "active"
-        }
-
-        if sentiment is None and intent is None:
-            update_command["$setOnInsert"] = insert_data
-        else:
-            update_command["$setOnInsert"] = insert_data
-
-        conversations_collection.update_one(
-            {"phone_number": phone_number},
-            update_command,
-            upsert=True
-        )
+        database.update_conversation(phone_number, sentiment, intent)
     except Exception as e:
         logger.error(f"Error updating conversation: {e}")
-
-
 
 if __name__ == "__main__":
     uvicorn.run(

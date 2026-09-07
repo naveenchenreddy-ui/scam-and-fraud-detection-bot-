@@ -16,7 +16,7 @@
 ### Required Software
 - **Python 3.11+** - Download from https://www.python.org
 - **Node.js 18+** - Download from https://nodejs.org
-- **MongoDB 7.0+** - Download from https://www.mongodb.com/try/download/community
+- **MySQL 8.0+** - Download from https://dev.mysql.com/downloads/mysql/
 - **Git** (optional) - Download from https://git-scm.com
 
 ### Twilio Account
@@ -51,13 +51,15 @@
    npm --version
    ```
 
-### Step 3: Install MongoDB
+### Step 3: Install MySQL
 
-1. Download from https://www.mongodb.com/try/download/community
-2. Run the MongoDB installer
-3. Choose "Complete" installation
-4. Check "Install MongoD as a Service"
-5. Start MongoDB service
+1. Download from https://dev.mysql.com/downloads/installer/
+2. Run the MySQL installer and choose the Server installation.
+3. Set a root password and keep the MySQL service enabled.
+4. Create the application database:
+   ```sql
+   CREATE DATABASE IF NOT EXISTS whatsapp_nlp_bot;
+   ```
 
 ### Step 4: Setup Project
 
@@ -105,16 +107,15 @@ npm --version
 
 Or download from https://nodejs.org
 
-### Step 3: Install MongoDB
+### Step 3: Install MySQL
 
 Using Homebrew:
 ```bash
-brew tap mongodb/brew
-brew install mongodb-community
-brew services start mongodb-community
+brew install mysql
+brew services start mysql
 ```
 
-Or download from https://www.mongodb.com
+Or download from https://dev.mysql.com/downloads/mysql/
 
 ### Step 4: Setup Project
 
@@ -166,20 +167,20 @@ nvm install 18
 node --version
 ```
 
-### Step 3: Install MongoDB
+### Step 3: Install MySQL
 
 Ubuntu/Debian:
 ```bash
-sudo apt-get install -y mongodb
-sudo systemctl start mongodb
-sudo systemctl enable mongodb
+sudo apt-get install -y mysql-server
+sudo systemctl start mysql
+sudo systemctl enable mysql
 ```
 
 Fedora:
 ```bash
-sudo dnf install mongodb-server
-sudo systemctl start mongod
-sudo systemctl enable mongod
+sudo dnf install mysql-server
+sudo systemctl start mysqld
+sudo systemctl enable mysqld
 ```
 
 ### Step 4: Setup Project
@@ -226,7 +227,7 @@ chmod +x start.sh
    - Frontend: http://localhost:3000
    - Backend: http://localhost:8000
    - API Docs: http://localhost:8000/docs
-   - MongoDB: localhost:27017
+   - MySQL: localhost:3306
 
 5. **Stop services:**
    ```bash
@@ -305,17 +306,14 @@ chmod +x start.sh
   npm install
   ```
 
-### MongoDB Issues
+### MySQL Issues
 
-**Error: "MongoDB connection refused"**
-- Solution: Start MongoDB
-- Windows: Check Services → MongoDB Server
-- macOS: `brew services start mongodb-community`
-- Linux: `sudo systemctl start mongodb`
+**Error: "Unknown database 'whatsapp_nlp_bot'"**
+- Solution: Create the database with `CREATE DATABASE whatsapp_nlp_bot;`
+- Confirm the `MYSQL_*` values in `backend/.env`.
 
 **Error: "cannot open shared object file"**
-- Solution: Install MongoDB dependencies
-- Ubuntu: `sudo apt-get install libssl1.1`
+- Solution: Install the MySQL server and client packages for your platform.
 
 ### FastAPI Issues
 
@@ -378,7 +376,7 @@ chmod +x start.sh
 
 1. **Backend Issues** → Check FastAPI logs
 2. **Frontend Issues** → Check browser console
-3. **Database Issues** → Check MongoDB logs
+3. **Database Issues** → Check MySQL logs and `MYSQL_*` settings
 4. **Integration Issues** → Check Twilio logs
 
 Happy coding! 🎉

@@ -1,8 +1,14 @@
+databases:
+  - name: whatsapp-nlp-postgres
+    databaseName: whatsapp_nlp_bot
+    user: whatsapp_nlp_bot
+    plan: free
+
 services:
   - type: web
     name: whatsapp-nlp-backend
     runtime: python
-    rootDir: whatsapp-nlp-bot/backend
+    rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
@@ -10,6 +16,10 @@ services:
         value: 3.11.9
       - key: MODEL_PATH
         value: ./best_fraud_detection_model.pkl
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whatsapp-nlp-postgres
+          property: connectionString
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import logging
 import joblib
 import uvicorn
+import psycopg2
 from twilio.rest import Client
 from urllib.parse import parse_qs
 
@@ -26,6 +27,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "hi")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +46,41 @@ app.add_middleware(
 )
 
 conversations: Dict[str, List[Dict]] = {}
+
+
+def get_db_connection():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_database():
+    connection = get_db_connection()
+    if connection is None:
+        logger.warning("DATABASE_URL is not configured; using in-memory conversation storage")
+        return
+    try:
+        with connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    phone_number TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    sentiment TEXT NOT NULL DEFAULT 'neutral',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        logger.info("PostgreSQL conversation storage initialized")
+    except Exception as exc:
+        logger.error(f"Failed to initialize PostgreSQL storage: {exc}")
+    finally:
+        connection.close()
+
+
+init_database()
 
 
 class SendMessageRequest(BaseModel):
@@ -234,6 +271,9 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.info(f"Classification: {category} ({confidence:.2%})")
         logger.info(f"Sending response: {bot_response}")
 
+        record_message(phone_number, user_message, "user", category)
+        record_message(phone_number, bot_response, "bot")
+
         # Send response
         background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
 
@@ -276,20 +316,70 @@ def send_whatsapp_message(phone_number: str, message: str):
 
 
 def record_message(phone_number: str, text: str, sender: str, sentiment: str = "neutral"):
+    connection = get_db_connection()
+    if connection is not None:
+        try:
+            with connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO messages (phone_number, text, sender, sentiment)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, created_at
+                    """,
+                    (phone_number, text, sender, sentiment),
+                )
+                message_id, timestamp = cursor.fetchone()
+            return {
+                "_id": str(message_id),
+                "phone_number": phone_number,
+                "text": text,
+                "sender": sender,
+                "sentiment": sentiment,
+                "timestamp": timestamp,
+            }
+        finally:
+            connection.close()
+
     timestamp = datetime.now()
     messages = conversations.setdefault(phone_number, [])
-    messages.append({
+    message = {
         "_id": f"{phone_number}-{len(messages) + 1}",
         "phone_number": phone_number,
         "text": text,
         "sender": sender,
         "sentiment": sentiment,
         "timestamp": timestamp,
-    })
+    }
+    messages.append(message)
+    return message
 
 
 @app.get("/api/dashboard/stats")
 async def dashboard_stats():
+    connection = get_db_connection()
+    if connection is not None:
+        try:
+            with connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*), COUNT(DISTINCT phone_number)
+                    FROM messages
+                    """
+                )
+                total_messages, total_conversations = cursor.fetchone()
+                cursor.execute(
+                    "SELECT sentiment, COUNT(*) FROM messages GROUP BY sentiment"
+                )
+                sentiment_distribution = dict(cursor.fetchall())
+            return {
+                "total_conversations": total_conversations,
+                "total_messages": total_messages,
+                "active_conversations": total_conversations,
+                "sentiment_distribution": sentiment_distribution,
+            }
+        finally:
+            connection.close()
+
     messages = [message for items in conversations.values() for message in items]
     sentiment_distribution: Dict[str, int] = {}
     for message in messages:
@@ -306,6 +396,38 @@ async def dashboard_stats():
 
 @app.get("/api/conversations")
 async def get_conversations(skip: int = 0, limit: int = 10):
+    connection = get_db_connection()
+    if connection is not None:
+        try:
+            with connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT phone_number, MAX(created_at) AS updated_at
+                    FROM messages
+                    GROUP BY phone_number
+                    ORDER BY updated_at DESC
+                    OFFSET %s LIMIT %s
+                    """,
+                    (skip, limit),
+                )
+                rows = cursor.fetchall()
+                cursor.execute("SELECT COUNT(DISTINCT phone_number) FROM messages")
+                total = cursor.fetchone()[0]
+            return {
+                "data": [
+                    {
+                        "_id": phone_number,
+                        "phone_number": phone_number,
+                        "status": "active",
+                        "updated_at": updated_at,
+                    }
+                    for phone_number, updated_at in rows
+                ],
+                "total": total,
+            }
+        finally:
+            connection.close()
+
     items = []
     for phone_number, messages in conversations.items():
         items.append({
@@ -321,6 +443,9 @@ async def get_conversations(skip: int = 0, limit: int = 10):
 
 @app.get("/api/conversations/{phone_number}")
 async def get_conversation(phone_number: str):
+    connection = get_db_connection()
+    if connection is not None:
+        return await get_messages(phone_number)
     if phone_number not in conversations:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"data": conversations[phone_number]}
@@ -328,6 +453,43 @@ async def get_conversation(phone_number: str):
 
 @app.get("/api/messages/{phone_number}")
 async def get_messages(phone_number: str, skip: int = 0, limit: int = 50):
+    connection = get_db_connection()
+    if connection is not None:
+        try:
+            with connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, phone_number, text, sender, sentiment, created_at
+                    FROM messages
+                    WHERE phone_number = %s
+                    ORDER BY created_at ASC, id ASC
+                    OFFSET %s LIMIT %s
+                    """,
+                    (phone_number, skip, limit),
+                )
+                rows = cursor.fetchall()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM messages WHERE phone_number = %s",
+                    (phone_number,),
+                )
+                total = cursor.fetchone()[0]
+            return {
+                "data": [
+                    {
+                        "_id": str(message_id),
+                        "phone_number": row_phone_number,
+                        "text": text,
+                        "sender": sender,
+                        "sentiment": sentiment,
+                        "timestamp": timestamp,
+                    }
+                    for message_id, row_phone_number, text, sender, sentiment, timestamp in rows
+                ],
+                "total": total,
+            }
+        finally:
+            connection.close()
+
     messages = conversations.get(phone_number, [])
     return {"data": messages[skip:skip + limit], "total": len(messages)}
 
@@ -339,9 +501,9 @@ async def send_message(message: SendMessageRequest, background_tasks: Background
     if not phone_number or not text:
         raise HTTPException(status_code=400, detail="phone_number and text are required")
 
-    record_message(phone_number, text, message.sender)
+    recorded_message = record_message(phone_number, text, message.sender)
     background_tasks.add_task(send_whatsapp_message, phone_number, text)
-    return {"success": True, "message": conversations[phone_number][-1]}
+    return {"success": True, "message": recorded_message}
 
 
 # Health check

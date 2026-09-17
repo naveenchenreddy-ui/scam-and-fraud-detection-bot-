@@ -40,8 +40,10 @@ export const apiService = {
     }),
   
   // Health check
-  getHealth: () =>
-    axios.get('http://localhost:8000/health'),
+  getHealth: () => {
+    const healthUrl = API_BASE_URL.replace(/\/api\/?$/, '') + '/health'
+    return axios.get(healthUrl)
+  },
 }
 
 export default api

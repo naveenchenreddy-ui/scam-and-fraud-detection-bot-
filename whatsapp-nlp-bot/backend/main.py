@@ -17,7 +17,11 @@ from urllib.parse import parse_qs
 load_dotenv()
 
 # Configuration
-MODEL_PATH = os.getenv("MODEL_PATH", "./fraud_phishing_nlp_model.pkl")
+DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_fraud_detection_model.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
+if not os.path.exists(MODEL_PATH) and os.path.exists(DEFAULT_MODEL_PATH):
+    MODEL_PATH = DEFAULT_MODEL_PATH
+
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
@@ -29,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 # FastAPI app
 app = FastAPI(title="WhatsApp NLP Bot API", version="1.0.0")
+
+# Enable CORS for cloud & local frontend deployments
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 conversations: Dict[str, List[Dict]] = {}
 
@@ -50,10 +63,17 @@ async def root():
 
 # ⭐ LOAD TRAINED MODEL
 trained_model = None
+vectorizer = None
 try:
-    trained_model = joblib.load(MODEL_PATH)
+    loaded_data = joblib.load(MODEL_PATH)
+    if isinstance(loaded_data, dict):
+        trained_model = loaded_data.get("model")
+        vectorizer = loaded_data.get("vectorizer")
+    else:
+        trained_model = loaded_data
     logger.info(f"✓ Loaded fraud detection model from {MODEL_PATH}")
-    logger.info(f"✓ Model classes: {trained_model.classes_}")
+    if trained_model is not None and hasattr(trained_model, "classes_"):
+        logger.info(f"✓ Model classes: {trained_model.classes_}")
 except Exception as exc:
     logger.error(f"✗ Failed to load model: {exc}")
     logger.warning("Using fallback (all messages marked as legitimate)")
@@ -92,18 +112,27 @@ def analyze_with_trained_model(text: str) -> Dict:
         }
 
     try:
-        # Get prediction
-        prediction = str(trained_model.predict([text])[0]).lower()
+        input_data = [text]
+        if vectorizer is not None:
+            input_data = vectorizer.transform(input_data)
+
+        raw_pred = trained_model.predict(input_data)[0]
+        if raw_pred == 1 or str(raw_pred).lower() in ["1", "fraud"]:
+            prediction = "fraud"
+        else:
+            prediction = "legitimate"
         
-        # Get probabilities
-        probabilities = trained_model.predict_proba([text])[0]
-        
-        prob_dict = {
-            str(label): round(float(prob), 4)
-            for label, prob in zip(trained_model.classes_, probabilities)
-        }
-        
-        confidence = max(prob_dict.values())
+        prob_dict = {}
+        confidence = 0.0
+        if hasattr(trained_model, "predict_proba"):
+            probabilities = trained_model.predict_proba(input_data)[0]
+            for label, prob in zip(trained_model.classes_, probabilities):
+                mapped_label = "fraud" if (label == 1 or str(label).lower() in ["1", "fraud"]) else "legitimate"
+                prob_dict[mapped_label] = round(float(prob), 4)
+            confidence = prob_dict.get(prediction, float(max(probabilities)))
+        else:
+            confidence = 1.0
+            prob_dict = {prediction: 1.0}
         
         logger.info(f"Classification: {prediction} (confidence: {confidence:.2%})")
 
@@ -344,4 +373,5 @@ async def test_classify(text: str):
     }
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

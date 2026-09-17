@@ -3,6 +3,8 @@ import { Settings as SettingsIcon, Copy, Check } from 'lucide-react'
 
 function Settings() {
   const [copied, setCopied] = useState(null)
+  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
+  const apiRoot = apiUrl.replace(/\/api\/?$/, '')
 
   const handleCopy = (text, id) => {
     navigator.clipboard.writeText(text)
@@ -13,18 +15,18 @@ function Settings() {
   const settings = [
     {
       label: 'API Base URL',
-      value: 'http://localhost:8000/api',
+      value: apiUrl,
       description: 'FastAPI server endpoint',
     },
     {
       label: 'Frontend URL',
-      value: 'http://localhost:3000',
+      value: window.location.origin,
       description: 'React dashboard URL',
     },
     {
-      label: 'WebSocket URL',
-      value: 'ws://localhost:8000/ws',
-      description: 'Real-time message updates',
+      label: 'Health Endpoint',
+      value: `${apiRoot}/health`,
+      description: 'API health check URL',
     },
   ]
 
@@ -132,7 +134,7 @@ function Settings() {
         </p>
         <div className="space-y-2">
           <a
-            href="http://localhost:8000/docs"
+            href={`${apiRoot}/docs`}
             target="_blank"
             rel="noopener noreferrer"
             className="block bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-center transition-colors"
@@ -140,7 +142,7 @@ function Settings() {
             Swagger UI Documentation
           </a>
           <a
-            href="http://localhost:8000/redoc"
+            href={`${apiRoot}/redoc`}
             target="_blank"
             rel="noopener noreferrer"
             className="block bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded text-center transition-colors"

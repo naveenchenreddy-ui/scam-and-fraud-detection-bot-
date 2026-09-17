@@ -1,0 +1,10 @@
+{
+  "framework": "vite",
+  "rootDirectory": "whatsapp-nlp-bot/frontend",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

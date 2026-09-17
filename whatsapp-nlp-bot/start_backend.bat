@@ -30,6 +30,7 @@ echo ============================================
 echo  Backend is starting on port 8000
 echo ============================================
 echo.
+
 echo API Documentation: http://localhost:8000/docs
 echo Health Check: http://localhost:8000/health
 echo.

@@ -32,12 +32,12 @@ echo.
 echo 🐍 Setting up Python backend...
 cd backend
 
-if not exist "venv" (
+if not exist ".venv" (
     echo Creating virtual environment...
-    python -m venv venv
+    python -m venv .venv
 )
 
-call venv\Scripts\activate.bat
+call .venv\Scripts\activate.bat
 
 echo Installing Python dependencies...
 pip install -q -r requirements.txt
@@ -72,8 +72,8 @@ echo ====================
 REM Start FastAPI
 echo Starting FastAPI server...
 cd backend
-call venv\Scripts\activate.bat
-start "FastAPI" python -m uvicorn main:app --reload --port 8000
+call ..\.venv\Scripts\activate.bat
+start "FastAPI" ..\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 cd ..
 echo ✓ FastAPI started
 echo   📚 Docs: http://localhost:8000/docs

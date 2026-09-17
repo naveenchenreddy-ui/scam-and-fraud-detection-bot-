@@ -5,9 +5,8 @@
 2. [Windows Setup](#windows-setup)
 3. [macOS Setup](#macos-setup)
 4. [Linux Setup](#linux-setup)
-5. [Docker Setup](#docker-setup)
-6. [Twilio Configuration](#twilio-configuration)
-7. [Troubleshooting](#troubleshooting)
+5. [Twilio Configuration](#twilio-configuration)
+6. [Troubleshooting](#troubleshooting)
 
 ---
 

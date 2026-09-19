@@ -287,15 +287,31 @@ async def handle_whatsapp_webhook(request: Request, background_tasks: Background
         
         logger.info(f"Received from {phone_number}: {user_message}")
 
+        # ⭐ Check user's preferred language; ask on first contact
+        locale = get_preferred_language(phone_number)
+
+        if locale is None:
+            choice = parse_language_choice(user_message)
+            if choice:
+                set_preferred_language(phone_number, choice)
+                bot_response = build_language_confirmation(choice)
+                record_message(phone_number, user_message, "user", "language_setup")
+                record_message(phone_number, bot_response, "bot")
+                background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
+                return {"success": True, "language_set": choice, "response": bot_response}
+            else:
+                bot_response = build_language_menu()
+                record_message(phone_number, user_message, "user", "language_setup")
+                record_message(phone_number, bot_response, "bot")
+                background_tasks.add_task(send_whatsapp_message, phone_number, bot_response)
+                return {"success": True, "awaiting_language": True, "response": bot_response}
+
         # ⭐ ROUTE TO TRAINED MODEL
         classification = analyze_with_trained_model(user_message)
         category = classification["category"]  # "fraud" or "legitimate"
         confidence = classification["confidence"]
         
         # Generate response in the user's preferred language
-        detected_locale = detect_language(user_message)
-        set_preferred_language(phone_number, detected_locale)
-        locale = get_preferred_language(phone_number)
         bot_response = build_response(category, locale)
         
         # Add confidence info if fraud
@@ -388,25 +404,6 @@ def record_message(phone_number: str, text: str, sender: str, sentiment: str = "
     return message
 
 
-def detect_language(text: str) -> str:
-    """Detect preferred locale from the message script (Devanagari -> hi, Telugu -> te)."""
-    if not text:
-        return DEFAULT_LOCALE
-    devanagari = 0
-    telugu = 0
-    for char in text:
-        code = ord(char)
-        if 0x0900 <= code <= 0x097F:
-            devanagari += 1
-        elif 0x0C00 <= code <= 0x0C7F:
-            telugu += 1
-    if devanagari > telugu:
-        return "hi"
-    if telugu > devanagari:
-        return "te"
-    return DEFAULT_LOCALE
-
-
 def set_preferred_language(phone_number: str, language: str):
     if language not in ["en", "hi", "te"]:
         language = "hi"
@@ -431,12 +428,12 @@ def set_preferred_language(phone_number: str, language: str):
         connection.close()
 
 
-def get_preferred_language(phone_number: str) -> str:
+def get_preferred_language(phone_number: str):
     if phone_number in user_languages:
         return user_languages[phone_number]
     connection = get_db_connection()
     if connection is None:
-        return DEFAULT_LOCALE
+        return None
     try:
         with connection, connection.cursor() as cursor:
             cursor.execute(
@@ -447,11 +444,41 @@ def get_preferred_language(phone_number: str) -> str:
         if row:
             user_languages[phone_number] = row[0]
             return row[0]
+        return None
     except Exception as exc:
         logger.error(f"Failed to load preferred language: {exc}")
     finally:
         connection.close()
-    return DEFAULT_LOCALE
+
+
+def parse_language_choice(text: str):
+    """Map a user's reply to a language ('1', 'hindi', 'te', etc.) or None."""
+    value = (text or "").strip().lower()
+    mappings = {
+        "1": "en", "english": "en", "en": "en",
+        "2": "hi", "hindi": "hi", "hi": "hi",
+        "3": "te", "telugu": "te", "te": "te",
+    }
+    return mappings.get(value)
+
+
+def build_language_menu() -> str:
+    return (
+        "Choose your language / अपनी भाषा चुनें / మీ భాషను ఎంచుకోండి\n\n"
+        "1. English\n"
+        "2. हिंदी (Hindi)\n"
+        "3. తెలుగు (Telugu)\n\n"
+        "Reply with 1, 2, or 3 (या अपनी भाषा चुनें)"
+    )
+
+
+def build_language_confirmation(language: str) -> str:
+    messages = {
+        "en": "✅ Language set to English. Now send me any suspicious message to check it.",
+        "hi": "✅ आपकी भाषा हिंदी चुन ली गई है। अब कोई भी संदिग्ध संदेश भेजें।",
+        "te": "✅ మీ భాష తెలుగుగా ఎంచుకున్నారు. ఇప్పుడు ఏదైనా అనుమానాస్పద సందేశం పంపండి.",
+    }
+    return messages.get(language, messages["en"])
 
 
 @app.get("/api/dashboard/stats")

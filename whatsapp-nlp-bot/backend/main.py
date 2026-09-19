@@ -242,22 +242,35 @@ async def handle_whatsapp_webhook(request: Request, background_tasks: Background
     
     try:
         # Parse request
-        content_type = request.headers.get("content-type", "")
-        
+        content_type = request.headers.get("content-type", "").lower()
+        form = {}
+        payload = {}
+
         if "application/x-www-form-urlencoded" in content_type:
             body_bytes = await request.body()
             form = parse_qs(body_bytes.decode("utf-8"))
-            from_value = form.get("From", [None])[0]
-            body_value = form.get("Body", [None])[0]
-            message_sid = form.get("MessageSid", [None])[0]
+        elif "multipart/form-data" in content_type:
+            form = await request.form()
+        elif "application/json" in content_type:
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
         else:
-            payload = await request.json()
-            from_value = payload.get("From")
-            body_value = payload.get("Body")
-            message_sid = payload.get("MessageSid")
+            body_bytes = await request.body()
+            if body_bytes:
+                try:
+                    payload = await request.json()
+                except Exception:
+                    form = parse_qs(body_bytes.decode("utf-8"))
+
+        from_value = (form.get("From") or [None])[0] if isinstance(form.get("From"), list) else (form.get("From") or payload.get("From"))
+        body_value = (form.get("Body") or [None])[0] if isinstance(form.get("Body"), list) else (form.get("Body") or payload.get("Body"))
+        message_sid = (form.get("MessageSid") or [None])[0] if isinstance(form.get("MessageSid"), list) else (form.get("MessageSid") or payload.get("MessageSid"))
 
         if not from_value or not body_value:
-            raise HTTPException(status_code=400, detail="Missing From or Body")
+            logger.warning(f"Webhook ignored: missing From or Body (content-type={content_type})")
+            return {"success": False, "error": "Missing From or Body"}
 
         phone_number = from_value.replace("whatsapp:", "").strip()
         user_message = body_value.strip()

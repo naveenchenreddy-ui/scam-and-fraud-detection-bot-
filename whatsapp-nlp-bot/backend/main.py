@@ -11,6 +11,7 @@ import logging
 import joblib
 import uvicorn
 import psycopg2
+import time
 from twilio.rest import Client
 from urllib.parse import parse_qs
 
@@ -28,6 +29,7 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "hi")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ALLOW_IN_MEMORY_FALLBACK = os.getenv("ALLOW_IN_MEMORY_FALLBACK", "").lower() in ["1", "true", "yes", "y"]
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -51,43 +53,65 @@ user_languages: Dict[str, str] = {}
 
 def get_db_connection():
     if not DATABASE_URL:
-        return None
+        if ALLOW_IN_MEMORY_FALLBACK:
+            return None
+        raise RuntimeError("DATABASE_URL is not configured; refusing to run without database storage")
     return psycopg2.connect(DATABASE_URL)
 
 
 def init_database():
-    connection = get_db_connection()
-    if connection is None:
-        logger.warning("DATABASE_URL is not configured; using in-memory conversation storage")
-        return
-    try:
-        with connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    id BIGSERIAL PRIMARY KEY,
-                    phone_number TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    sender TEXT NOT NULL,
-                    sentiment TEXT NOT NULL DEFAULT 'neutral',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    if not DATABASE_URL:
+        if ALLOW_IN_MEMORY_FALLBACK:
+            logger.warning("DATABASE_URL is not configured; using in-memory conversation storage (dev only)")
+            return
+        logger.error(
+            "DATABASE_URL is not configured. Database storage is required. "
+            "Set ALLOW_IN_MEMORY_FALLBACK=true in the environment for local development only."
+        )
+        raise SystemExit(1)
+    connection = None
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            connection = get_db_connection()
+            with connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id BIGSERIAL PRIMARY KEY,
+                        phone_number TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        sender TEXT NOT NULL,
+                        sentiment TEXT NOT NULL DEFAULT 'neutral',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
                 )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_preferences (
-                    phone_number TEXT PRIMARY KEY,
-                    preferred_language TEXT NOT NULL DEFAULT 'hi',
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_preferences (
+                        phone_number TEXT PRIMARY KEY,
+                        preferred_language TEXT NOT NULL DEFAULT 'hi',
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
                 )
-                """
-            )
-        logger.info("PostgreSQL conversation storage initialized")
-    except Exception as exc:
-        logger.error(f"Failed to initialize PostgreSQL storage: {exc}")
-    finally:
+            logger.info("PostgreSQL conversation storage initialized")
+            break
+        except Exception as exc:
+            last_error = exc
+            connection = None
+            logger.error(f"PostgreSQL connection attempt {attempt}/5 failed: {exc}")
+            if attempt < 5:
+                time.sleep(5)
+    if connection is not None:
         connection.close()
+    if last_error is not None:
+        logger.error(
+            "Database storage is required but could not be reached. "
+            "Verify DATABASE_URL or set ALLOW_IN_MEMORY_FALLBACK=true for local development only."
+        )
+        raise SystemExit(1)
 
 
 init_database()

@@ -98,6 +98,11 @@ async def root():
         "health": "/health",
     }
 
+
+@app.post("/")
+async def root_webhook(request: Request, background_tasks: BackgroundTasks):
+    return await handle_whatsapp_webhook(request, background_tasks)
+
 # ⭐ LOAD TRAINED MODEL
 trained_model = None
 vectorizer = None
@@ -226,8 +231,12 @@ def build_response(category: str, language: str) -> str:
 # ⭐ WhatsApp Webhook - Routes to model
 @app.post("/api/messages/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    return await handle_whatsapp_webhook(request, background_tasks)
+
+
+async def handle_whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Main webhook for incoming WhatsApp messages
+    Main webhook logic for incoming WhatsApp messages
     Routes to trained fraud detection model
     """
     

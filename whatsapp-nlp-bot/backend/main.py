@@ -46,6 +46,7 @@ app.add_middleware(
 )
 
 conversations: Dict[str, List[Dict]] = {}
+user_languages: Dict[str, str] = {}
 
 
 def get_db_connection():
@@ -70,6 +71,15 @@ def init_database():
                     sender TEXT NOT NULL,
                     sentiment TEXT NOT NULL DEFAULT 'neutral',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    phone_number TEXT PRIMARY KEY,
+                    preferred_language TEXT NOT NULL DEFAULT 'hi',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -282,8 +292,10 @@ async def handle_whatsapp_webhook(request: Request, background_tasks: Background
         category = classification["category"]  # "fraud" or "legitimate"
         confidence = classification["confidence"]
         
-        # Generate response
-        locale = "hi"  # Or get from user preferences
+        # Generate response in the user's preferred language
+        detected_locale = detect_language(user_message)
+        set_preferred_language(phone_number, detected_locale)
+        locale = get_preferred_language(phone_number)
         bot_response = build_response(category, locale)
         
         # Add confidence info if fraud
@@ -374,6 +386,72 @@ def record_message(phone_number: str, text: str, sender: str, sentiment: str = "
     }
     messages.append(message)
     return message
+
+
+def detect_language(text: str) -> str:
+    """Detect preferred locale from the message script (Devanagari -> hi, Telugu -> te)."""
+    if not text:
+        return DEFAULT_LOCALE
+    devanagari = 0
+    telugu = 0
+    for char in text:
+        code = ord(char)
+        if 0x0900 <= code <= 0x097F:
+            devanagari += 1
+        elif 0x0C00 <= code <= 0x0C7F:
+            telugu += 1
+    if devanagari > telugu:
+        return "hi"
+    if telugu > devanagari:
+        return "te"
+    return DEFAULT_LOCALE
+
+
+def set_preferred_language(phone_number: str, language: str):
+    if language not in ["en", "hi", "te"]:
+        language = "hi"
+    user_languages[phone_number] = language
+    connection = get_db_connection()
+    if connection is None:
+        return
+    try:
+        with connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO user_preferences (phone_number, preferred_language, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (phone_number)
+                DO UPDATE SET preferred_language = EXCLUDED.preferred_language, updated_at = CURRENT_TIMESTAMP
+                """,
+                (phone_number, language),
+            )
+    except Exception as exc:
+        logger.error(f"Failed to save preferred language: {exc}")
+    finally:
+        connection.close()
+
+
+def get_preferred_language(phone_number: str) -> str:
+    if phone_number in user_languages:
+        return user_languages[phone_number]
+    connection = get_db_connection()
+    if connection is None:
+        return DEFAULT_LOCALE
+    try:
+        with connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT preferred_language FROM user_preferences WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cursor.fetchone()
+        if row:
+            user_languages[phone_number] = row[0]
+            return row[0]
+    except Exception as exc:
+        logger.error(f"Failed to load preferred language: {exc}")
+    finally:
+        connection.close()
+    return DEFAULT_LOCALE
 
 
 @app.get("/api/dashboard/stats")
@@ -555,6 +633,20 @@ async def test_classify(text: str):
         "classification": classification,
         "response": response
     }
+
+
+# User preferences
+@app.get("/api/users/{phone_number}/language")
+async def get_user_language(phone_number: str):
+    return {"phone_number": phone_number, "preferred_language": get_preferred_language(phone_number)}
+
+
+@app.put("/api/users/{phone_number}/language")
+async def update_user_language(phone_number: str, lang: str):
+    if lang not in ["en", "hi", "te"]:
+        raise HTTPException(status_code=400, detail="lang must be one of: en, hi, te")
+    set_preferred_language(phone_number.strip(), lang)
+    return {"phone_number": phone_number, "preferred_language": lang}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
